@@ -41,7 +41,8 @@ static void EnqueueLog(ConcurrentDictionary<string, ConcurrentQueue<string>> sto
     while (q.Count > 200 && q.TryDequeue(out _)) { }
 }
 
-string[] stepOrder = new[] { "frontend", "backend", "gitea", "confluence", "jira" };
+// FIX: Adaugă artifactory și github în stepOrder!
+string[] stepOrder = new[] { "frontend", "backend", "gitea", "confluence", "jira", "artifactory", "github" };
 
 static string N(string? s) => (s ?? "").Trim().ToLowerInvariant();
 static int Rank(string s) => (N(s)) switch
@@ -195,49 +196,54 @@ app.MapGet("/status", async (HttpContext http, string operation) =>
         if (root.TryGetProperty("metadata", out var metadata))
         {
             // Extract buildId from metadata.build.id
-            if (metadata.TryGetProperty("build", out var build))
+            if (metadata.TryGetProperty("build", out var buildEl) &&
+                buildEl.TryGetProperty("id", out var idEl))
             {
-                if (build.TryGetProperty("id", out var idEl))
-                    buildId = idEl.GetString();
+                buildId = idEl.GetString();
+            }
 
-                if (build.TryGetProperty("status", out var statusEl))
-                    state = statusEl.GetString() ?? "UNKNOWN";
+            if (buildEl.ValueKind != JsonValueKind.Undefined)
+            {
+                // status
+                if (buildEl.TryGetProperty("status", out var statusEl))
+                    state = statusEl.GetString()?.ToUpperInvariant() ?? "UNKNOWN";
 
-                if (build.TryGetProperty("logUrl", out var logUrlEl))
+                // logUrl
+                if (buildEl.TryGetProperty("logUrl", out var logUrlEl))
                     logUrl = logUrlEl.GetString();
 
-                // Parse steps from Cloud Build
-                if (build.TryGetProperty("steps", out var stepsEl) && stepsEl.ValueKind == JsonValueKind.Array)
+                // canonical steps
+                if (buildEl.TryGetProperty("steps", out var stepsEl) && stepsEl.ValueKind == JsonValueKind.Array)
                 {
                     foreach (var step in stepsEl.EnumerateArray())
                     {
-                        if (!step.TryGetProperty("id", out var stepIdEl)) continue;
-                        var stepId = N(stepIdEl.GetString() ?? "");
+                        string? stepId = null;
+                        string? stepStatus = null;
 
-                        // Only include canonical steps
-                        if (!stepOrder.Contains(stepId)) continue;
+                        if (step.TryGetProperty("id", out var stepIdEl)) stepId = stepIdEl.GetString();
+                        if (step.TryGetProperty("status", out var stepStatusEl)) stepStatus = stepStatusEl.GetString();
 
-                        string stepStatus = "UNKNOWN";
-                        if (step.TryGetProperty("status", out var stepStatusEl))
-                            stepStatus = stepStatusEl.GetString() ?? "UNKNOWN";
-
-                        merged[stepId] = stepStatus.ToUpperInvariant();
+                        if (!string.IsNullOrWhiteSpace(stepId) && !string.IsNullOrWhiteSpace(stepStatus))
+                        {
+                            var norm = N(stepId);
+                            var incoming = stepStatus?.ToUpperInvariant() ?? "QUEUED";
+                            if (!merged.TryGetValue(norm, out var prev) || Rank(incoming) >= Rank(prev))
+                                merged[norm] = incoming;
+                        }
                     }
                 }
             }
         }
 
-        // 2) Overlay live data from /progress callbacks (if buildId was resolved)
-        if (!string.IsNullOrEmpty(buildId) && stepStore.TryGetValue(buildId, out var liveSteps))
+        // 2) Overlay live progress from callbacks (if buildId found)
+        if (!string.IsNullOrEmpty(buildId) && stepStore.TryGetValue(buildId, out var liveMap))
         {
-            foreach (var kv in liveSteps)
+            foreach (var kv in liveMap)
             {
-                var id = N(kv.Key);
-                if (!stepOrder.Contains(id)) continue;
-
-                var live = NormalizeLive(kv.Value);
-                if (!merged.TryGetValue(id, out var cur) || Rank(live) >= Rank(cur))
-                    merged[id] = live;
+                var norm = kv.Key;
+                var incoming = kv.Value.ToUpperInvariant();
+                if (!merged.TryGetValue(norm, out var prev) || Rank(incoming) >= Rank(prev))
+                    merged[norm] = incoming;
             }
         }
 

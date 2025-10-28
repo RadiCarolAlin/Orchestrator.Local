@@ -1,0 +1,47 @@
+## Ignore Visual Studio temporary files, build results
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Build results
+[Dd]ebug/
+[Dd]ebugPublic/
+[Rr]elease/
+[Rr]eleases/
+x64/
+x86/
+bld/
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+
+# Visual Studio cache
+.vs/
+
+# .NET Core
+project.lock.json
+project.fragment.lock.json
+artifacts/
+
+# NuGet Packages
+*.nupkg
+**/packages/*
+
+# Rider
+.idea/
+
+# Sensitive configuration files
+appsettings.Development.json
+appsettings.*.json
+!appsettings.json
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Google Cloud credentials
+*.json
+!appsettings.json
+credentials.json
+service-account*.json

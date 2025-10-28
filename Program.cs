@@ -7,25 +7,18 @@ using System.Collections.Concurrent;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// === Config din appsettings.json sau ENV ===
-var projectId = builder.Configuration["Gcp:ProjectId"]
-               ?? Environment.GetEnvironmentVariable("PROJECT_ID")
-               ?? "";
-var triggerId = builder.Configuration["Gcp:TriggerId"]
-               ?? Environment.GetEnvironmentVariable("TRIGGER_ID")
-               ?? "";
-var region    = builder.Configuration["Gcp:Region"]
-               ?? Environment.GetEnvironmentVariable("REGION")
-               ?? "global"; // triggerul tău e global
+// === Config (ENV overrides appsettings.json) ===
+string projectId   = builder.Configuration["Gcp:ProjectId"]   ?? Environment.GetEnvironmentVariable("PROJECT_ID")   ?? "";
+string triggerId   = builder.Configuration["Gcp:TriggerId"]   ?? Environment.GetEnvironmentVariable("TRIGGER_ID")   ?? "";
+string region      = builder.Configuration["Gcp:Region"]      ?? Environment.GetEnvironmentVariable("REGION")       ?? "global";
+string progressUrl = builder.Configuration["Gcp:ProgressUrl"] ?? Environment.GetEnvironmentVariable("PROGRESS_URL") ?? "";
 
-var progressUrl = builder.Configuration["Gcp:ProgressUrl"]
-               ?? Environment.GetEnvironmentVariable("PROGRESS_URL")
-               ?? ""; // dacă e gol, nu trimitem _PROGRESS_URL
-
+// CORS for local UI
 builder.Services.AddCors(opt =>
 {
     opt.AddPolicy("ui", p => p
-        .WithOrigins("http://localhost:4200")
+        .WithOrigins("http://localhost:4200","http://127.0.0.1:4200",
+                     "http://localhost:51516","http://127.0.0.1:51516")
         .AllowAnyHeader()
         .AllowAnyMethod());
 });
@@ -34,14 +27,41 @@ builder.Services.AddEndpointsApiExplorer();
 var app = builder.Build();
 app.UseCors("ui");
 
-// === Store in-memory pt. status live pe pași (populate de /progress) ===
+// === In-memory live store (fed by /progress) ===
 var stepStore = new ConcurrentDictionary<string, ConcurrentDictionary<string, string>>();
-// key: buildId ; val: stepId -> status ("START" | "DONE" | "FAIL")
+// key: buildId ; value: stepId(lower) -> "START" | "DONE" | "FAIL"
 
-// --- Health ---
+// live logs (last 200 lines / build)
+var logStore  = new ConcurrentDictionary<string, ConcurrentQueue<string>>();
+
+static void EnqueueLog(ConcurrentDictionary<string, ConcurrentQueue<string>> store, string buildId, string line)
+{
+    var q = store.GetOrAdd(buildId, _ => new ConcurrentQueue<string>());
+    q.Enqueue($"{DateTime.UtcNow:HH:mm:ss}  {line}");
+    while (q.Count > 200 && q.TryDequeue(out _)) { }
+}
+
+string[] stepOrder = new[] { "frontend", "backend", "gitea", "confluence", "jira" };
+
+static string N(string? s) => (s ?? "").Trim().ToLowerInvariant();
+static int Rank(string s) => (N(s)) switch
+{
+    "failure" or "fail" or "internal_error" or "timeout" or "cancelled" => 5,
+    "success"                                                           => 4,
+    "running" or "working" or "queued"                                  => 3,
+    "start"                                                             => 2,
+    "unknown" or ""                                                     => 1,
+    _                                                                   => 1
+};
+static string NormalizeLive(string s) => (N(s)) switch
+{
+    "start" => "RUNNING",
+    "done"  => "SUCCESS",
+    _       => s.ToUpperInvariant()
+};
+
+// --- Health & debug ---
 app.MapGet("/healthz", () => Results.Ok("ok"));
-
-// --- Rute pt. debugging ---
 app.MapGet("/routes", (IEnumerable<EndpointDataSource> sources) =>
 {
     var all = sources.SelectMany(s => s.Endpoints)
@@ -54,34 +74,38 @@ app.MapGet("/routes", (IEnumerable<EndpointDataSource> sources) =>
     return Results.Ok(all);
 });
 
-// --- Callback din Cloud Build pentru progres pe pași ---
-// ex: POST /progress?op=$BUILD_ID&step=frontend&status=START|DONE|FAIL
+// --- /progress (callbacks from Cloud Build) ---
+// POST /progress?op=$BUILD_ID&step=frontend&status=START|DONE|FAIL
 app.MapPost("/progress", (HttpRequest req) =>
 {
     var buildId = req.Query["op"].ToString();
-    var step    = req.Query["step"].ToString();
+    var step    = N(req.Query["step"].ToString());
     var status  = req.Query["status"].ToString();
 
     if (string.IsNullOrWhiteSpace(buildId) || string.IsNullOrWhiteSpace(step))
         return Results.BadRequest(new { ok = false, error = "missing op/step" });
 
     var map = stepStore.GetOrAdd(buildId, _ => new ConcurrentDictionary<string, string>());
-    map[step.ToLowerInvariant()] = (status ?? "START").ToUpperInvariant();
+    var incoming = NormalizeLive(status);
+    map.AddOrUpdate(step, incoming, (_, prev) => Rank(incoming) >= Rank(prev) ? incoming : prev);
+
+    // log live
+    EnqueueLog(logStore, buildId, $"[{step}] {(status ?? "START").ToUpperInvariant()}");
 
     return Results.Ok(new { ok = true });
 });
 
-// --- Preflight CORS ---
+// Preflight
 app.MapMethods("/run", new[] { "OPTIONS" }, () => Results.Ok());
 
-// --- GET /run (diagnostic) ---
+// GET /run (diagnostic)
 app.MapGet("/run", () => Results.Ok("run-get-ok"));
 
-// --- POST /run — pornește triggerul Cloud Build ---
+// --- /run: start Cloud Build trigger ---
 app.MapPost("/run", async (RunRequest req) =>
 {
     if (string.IsNullOrWhiteSpace(projectId) || string.IsNullOrWhiteSpace(triggerId))
-        return Results.BadRequest(new { ok = false, error = "Set PROJECT_ID și TRIGGER_ID (env sau appsettings.json)" });
+        return Results.BadRequest(new { ok = false, error = "Set PROJECT_ID și TRIGGER_ID" });
 
     try
     {
@@ -90,10 +114,8 @@ app.MapPost("/run", async (RunRequest req) =>
         var token = await scoped.UnderlyingCredential.GetAccessTokenForRequestAsync();
 
         var url = $"https://cloudbuild.googleapis.com/v1/projects/{projectId}/locations/{region}/triggers/{triggerId}:run";
-
         var branch = string.IsNullOrWhiteSpace(req.Branch) ? "main" : req.Branch;
 
-        // substitutions (inclusiv PROGRESS_URL dacă e setat)
         var subs = new Dictionary<string, string?>
         {
             ["_TARGETS"] = string.IsNullOrWhiteSpace(req.Targets) ? "frontend,backend" : req.Targets
@@ -118,8 +140,7 @@ app.MapPost("/run", async (RunRequest req) =>
         var resp = await http.PostAsync(url, new StringContent(json, Encoding.UTF8, "application/json"));
         var text = await resp.Content.ReadAsStringAsync();
 
-        if (!resp.IsSuccessStatusCode)
-            return Results.Problem(text, statusCode: (int)resp.StatusCode);
+        if (!resp.IsSuccessStatusCode) return Results.Problem(text, statusCode: (int)resp.StatusCode);
 
         using var doc = JsonDocument.Parse(text);
         string? opName = doc.RootElement.TryGetProperty("name", out var n) ? n.GetString() : null;
@@ -132,28 +153,33 @@ app.MapPost("/run", async (RunRequest req) =>
     }
 });
 
-// --- GET /status?operation=... ---
-app.MapGet("/status", async (string operation) =>
+// --- /status: merge Cloud Build + live overlay (show only canonical steps) ---
+// FIX pentru Program.cs - înlocuiește endpoint-ul /status
+// Linia aproximativ 157-341
+
+app.MapGet("/status", async (HttpContext http, string operation) =>
 {
     try
     {
+        http.Response.Headers.CacheControl = "no-store";
+
         var credential = await GoogleCredential.GetApplicationDefaultAsync();
         var scoped = credential.CreateScoped("https://www.googleapis.com/auth/cloud-platform");
         var token = await scoped.UnderlyingCredential.GetAccessTokenForRequestAsync();
 
-        var op = operation.StartsWith("projects/")
-            ? operation
-            : $"projects/{projectId}/locations/{(string.IsNullOrWhiteSpace(region) ? "global" : region)}/operations/{operation}";
+        // normalize operation path
+        var opPath =
+            operation.StartsWith("projects/", StringComparison.OrdinalIgnoreCase)   ? operation :
+            operation.StartsWith("operations/", StringComparison.OrdinalIgnoreCase) ? operation :
+            $"projects/{projectId}/locations/{(string.IsNullOrWhiteSpace(region) ? "global" : region)}/operations/{operation}";
 
-        var url = $"https://cloudbuild.googleapis.com/v1/{op}";
+        var url = $"https://cloudbuild.googleapis.com/v1/{opPath}";
 
-        using var http = new HttpClient();
-        http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
-        var resp = await http.GetAsync(url);
+        using var httpClient = new HttpClient();
+        httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
+        var resp = await httpClient.GetAsync(url);
         var text = await resp.Content.ReadAsStringAsync();
-
-        if (!resp.IsSuccessStatusCode)
-            return Results.Problem(text, statusCode: (int)resp.StatusCode);
+        if (!resp.IsSuccessStatusCode) return Results.Problem(text, statusCode: (int)resp.StatusCode);
 
         using var doc = JsonDocument.Parse(text);
         var root = doc.RootElement;
@@ -161,73 +187,74 @@ app.MapGet("/status", async (string operation) =>
         bool done = root.TryGetProperty("done", out var doneEl) && doneEl.GetBoolean();
         string state = "UNKNOWN";
         string? logUrl = null;
-        string? buildId = null;
+        string? buildId = null; // <-- CRUCIAL: extrage din metadata, nu din path
 
-        int total = 0, finished = 0;
-        var stepsOut = new List<object>();
+        var merged = new Dictionary<string, string>();
 
-        if (root.TryGetProperty("metadata", out var meta) &&
-            meta.TryGetProperty("build", out var build))
+        // 1) Extract build info from metadata
+        if (root.TryGetProperty("metadata", out var metadata))
         {
-            if (build.TryGetProperty("status", out var st))
-                state = st.GetString() ?? "UNKNOWN";
-
-            if (build.TryGetProperty("logUrl", out var lu))
-                logUrl = lu.GetString();
-
-            if (build.TryGetProperty("id", out var idEl))
-                buildId = idEl.GetString();
-
-            // 1) Pașii raportați de Cloud Build (de obicei disponibili la final)
-            if (build.TryGetProperty("steps", out var steps) && steps.ValueKind == JsonValueKind.Array)
+            // Extract buildId from metadata.build.id
+            if (metadata.TryGetProperty("build", out var build))
             {
-                total = steps.GetArrayLength();
-                foreach (var s in steps.EnumerateArray())
+                if (build.TryGetProperty("id", out var idEl))
+                    buildId = idEl.GetString();
+
+                if (build.TryGetProperty("status", out var statusEl))
+                    state = statusEl.GetString() ?? "UNKNOWN";
+
+                if (build.TryGetProperty("logUrl", out var logUrlEl))
+                    logUrl = logUrlEl.GetString();
+
+                // Parse steps from Cloud Build
+                if (build.TryGetProperty("steps", out var stepsEl) && stepsEl.ValueKind == JsonValueKind.Array)
                 {
-                    string id = s.TryGetProperty("id", out var idProp) ? idProp.GetString() ?? "" : "";
-                    if (string.IsNullOrWhiteSpace(id))
-                        id = s.TryGetProperty("name", out var nm) ? nm.GetString() ?? "" : "";
+                    foreach (var step in stepsEl.EnumerateArray())
+                    {
+                        if (!step.TryGetProperty("id", out var stepIdEl)) continue;
+                        var stepId = N(stepIdEl.GetString() ?? "");
 
-                    string stepStatus = s.TryGetProperty("status", out var ss)
-                        ? ss.GetString() ?? "UNKNOWN"
-                        : "UNKNOWN";
+                        // Only include canonical steps
+                        if (!stepOrder.Contains(stepId)) continue;
 
-                    bool isDone = stepStatus is "SUCCESS" or "FAILURE" or "CANCELLED" or "INTERNAL_ERROR" or "TIMEOUT";
-                    if (isDone) finished++;
+                        string stepStatus = "UNKNOWN";
+                        if (step.TryGetProperty("status", out var stepStatusEl))
+                            stepStatus = stepStatusEl.GetString() ?? "UNKNOWN";
 
-                    stepsOut.Add(new { id, status = stepStatus });
+                        merged[stepId] = stepStatus.ToUpperInvariant();
+                    }
                 }
-            }
-
-            // 2) Suprascriem/îmbogățim cu ce vine live prin /progress
-            if (!string.IsNullOrEmpty(buildId) && stepStore.TryGetValue(buildId, out var liveMap))
-            {
-                var live = liveMap.Select(kv => new { id = kv.Key, status = kv.Value }).ToList();
-
-                if (stepsOut.Count == 0)
-                {
-                    stepsOut.AddRange(live);
-                }
-                else
-                {
-                    var dict = stepsOut.ToDictionary(
-                        x => ((dynamic)x).id?.ToString()?.ToLowerInvariant() ?? "",
-                        x => x
-                    );
-                    foreach (var l in live)
-                        dict[l.id.ToLowerInvariant()] = l;
-
-                    stepsOut = dict.Values.ToList();
-                }
-
-                // recalculăm total/finished după live
-                var doneSet = new HashSet<string> { "SUCCESS", "DONE", "FAIL", "FAILURE", "CANCELLED", "INTERNAL_ERROR", "TIMEOUT" };
-                total = stepsOut.Count;
-                finished = stepsOut.Count(x => doneSet.Contains(((dynamic)x).status?.ToString()?.ToUpperInvariant() ?? ""));
             }
         }
 
-        // procent (fallback dacă n-avem pași)
+        // 2) Overlay live data from /progress callbacks (if buildId was resolved)
+        if (!string.IsNullOrEmpty(buildId) && stepStore.TryGetValue(buildId, out var liveSteps))
+        {
+            foreach (var kv in liveSteps)
+            {
+                var id = N(kv.Key);
+                if (!stepOrder.Contains(id)) continue;
+
+                var live = NormalizeLive(kv.Value);
+                if (!merged.TryGetValue(id, out var cur) || Rank(live) >= Rank(cur))
+                    merged[id] = live;
+            }
+        }
+
+        // 3) Build ordered list for UI
+        var stepsOut = new List<object>();
+        foreach (var id in stepOrder)
+            if (merged.TryGetValue(id, out var stCanon))
+                stepsOut.Add(new { id, status = stCanon });
+
+        // 4) Percent
+        int total = stepsOut.Count;
+        int finished = stepsOut.Count(x =>
+        {
+            var stCanon = ((dynamic)x).status?.ToString()?.ToUpperInvariant() ?? "";
+            return stCanon is "SUCCESS" or "FAILURE" or "CANCELLED" or "INTERNAL_ERROR" or "TIMEOUT";
+        });
+
         int percent;
         if (total > 0)
         {
@@ -247,6 +274,25 @@ app.MapGet("/status", async (string operation) =>
         }
         if (done && state == "SUCCESS") percent = 100;
 
+        // 5) Live events (din logStore) - ACUM VA FUNCȚIONA!
+        var eventsOut = new List<string>();
+        if (!string.IsNullOrEmpty(buildId) && logStore.TryGetValue(buildId, out var q))
+        {
+            eventsOut = q.ToList();
+            Console.WriteLine($"[DEBUG] Found {eventsOut.Count} events for buildId: {buildId}");
+        }
+        else
+        {
+            Console.WriteLine($"[DEBUG] No events found for buildId: {buildId ?? "(null)"}");
+        }
+
+        // cleanup memory when finished
+        if (done && !string.IsNullOrEmpty(buildId))
+        {
+            stepStore.TryRemove(buildId, out _);
+            logStore.TryRemove(buildId, out _);
+        }
+
         return Results.Ok(new
         {
             ok = true,
@@ -254,7 +300,130 @@ app.MapGet("/status", async (string operation) =>
             state,
             percent,
             logs = logUrl,
-            steps = stepsOut
+            steps = stepsOut,
+            events = eventsOut,
+            buildId = buildId // <-- ADAUGĂ PENTRU DEBUG
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(ex.ToString(), statusCode: 500);
+    }
+});
+
+// --- /logs: citește logurile Cloud Build din Cloud Logging (live/paginate) ---
+// GET /logs?operation=...&pageToken=...&since=2025-10-27T15:00:00Z
+app.MapGet("/logs", async (HttpContext http, string operation, string? pageToken, string? since) =>
+{
+    try
+    {
+        http.Response.Headers.CacheControl = "no-store";
+
+        static string NormalizeOp(string op, string projectId, string region)
+            => op.StartsWith("projects/", StringComparison.OrdinalIgnoreCase) || op.StartsWith("operations/", StringComparison.OrdinalIgnoreCase)
+               ? op
+               : $"projects/{projectId}/locations/{(string.IsNullOrWhiteSpace(region) ? "global" : region)}/operations/{op}";
+
+        var opPath = NormalizeOp(operation, projectId, region);
+
+        string? buildId = null;
+        if (opPath.StartsWith("operations/build/", StringComparison.OrdinalIgnoreCase))
+        {
+            var parts = opPath.Split('/', StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length >= 4) buildId = parts[^1];
+        }
+
+        if (string.IsNullOrEmpty(buildId))
+        {
+            var cred0 = await GoogleCredential.GetApplicationDefaultAsync();
+            var scoped0 = cred0.CreateScoped("https://www.googleapis.com/auth/cloud-platform");
+            var token0 = await scoped0.UnderlyingCredential.GetAccessTokenForRequestAsync();
+
+            using var hc0 = new HttpClient();
+            hc0.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token0);
+            var getUrl = $"https://cloudbuild.googleapis.com/v1/{opPath}";
+            var r0 = await hc0.GetAsync(getUrl);
+            var t0 = await r0.Content.ReadAsStringAsync();
+            if (!r0.IsSuccessStatusCode) return Results.Problem(t0, statusCode: (int)r0.StatusCode);
+
+            using var d0 = JsonDocument.Parse(t0);
+            if (d0.RootElement.TryGetProperty("metadata", out var meta) &&
+                meta.TryGetProperty("build", out var build) &&
+                build.TryGetProperty("id", out var idEl))
+            {
+                buildId = idEl.GetString();
+            }
+        }
+
+        if (string.IsNullOrEmpty(buildId))
+            return Results.BadRequest(new { ok = false, error = "cannot resolve buildId" });
+
+        var cred = await GoogleCredential.GetApplicationDefaultAsync();
+        var scoped = cred.CreateScoped(new[]
+        {
+            "https://www.googleapis.com/auth/cloud-platform",
+            "https://www.googleapis.com/auth/logging.read"
+        });
+        var token = await scoped.UnderlyingCredential.GetAccessTokenForRequestAsync();
+
+        var filter = $"resource.type=\"build\" AND labels.build_id=\"{buildId}\"";
+        if (!string.IsNullOrWhiteSpace(since) && DateTimeOffset.TryParse(since, out var sinceTs))
+        {
+            var iso = sinceTs.UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'");
+            filter += $" AND timestamp>=\"{iso}\"";
+        }
+
+        var body = new
+        {
+            resourceNames = new[] { $"projects/{projectId}" },
+            filter,
+            orderBy = "timestamp asc",
+            pageSize = 500,
+            pageToken = pageToken
+        };
+
+        using var httpClient = new HttpClient();
+        httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
+        var json = JsonSerializer.Serialize(body);
+        var resp = await httpClient.PostAsync(
+            "https://logging.googleapis.com/v2/entries:list",
+            new StringContent(json, Encoding.UTF8, "application/json"));
+
+        var text = await resp.Content.ReadAsStringAsync();
+        if (!resp.IsSuccessStatusCode) return Results.Problem(text, statusCode: (int)resp.StatusCode);
+
+        using var doc = JsonDocument.Parse(text);
+        var arr = new List<object>();
+        string? next = null;
+
+        if (doc.RootElement.TryGetProperty("entries", out var entries) && entries.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var e in entries.EnumerateArray())
+            {
+                string ts =
+                    e.TryGetProperty("timestamp", out var tsEl) ? tsEl.GetString() ?? "" : "";
+                string line =
+                    e.TryGetProperty("textPayload", out var tp) ? tp.GetString() ?? "" :
+                    e.TryGetProperty("jsonPayload", out var jp) && jp.TryGetProperty("message", out var msg) ? msg.GetString() ?? "" :
+                    e.TryGetProperty("protoPayload", out var pp) && pp.TryGetProperty("@type", out var _) ? pp.ToString() :
+                    e.ToString();
+
+                foreach (var ln in (line ?? "").Replace("\r\n","\n").Split('\n'))
+                {
+                    if (!string.IsNullOrEmpty(ln))
+                        arr.Add(new { ts, line = ln });
+                }
+            }
+        }
+        if (doc.RootElement.TryGetProperty("nextPageToken", out var npt))
+            next = npt.GetString();
+
+        return Results.Ok(new
+        {
+            ok = true,
+            buildId,
+            nextPageToken = next,
+            entries = arr
         });
     }
     catch (Exception ex)
@@ -265,5 +434,5 @@ app.MapGet("/status", async (string operation) =>
 
 app.Run();
 
-// DTO pt. /run
+// DTO for /run
 public record RunRequest(string Targets, string Branch);

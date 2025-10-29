@@ -246,6 +246,46 @@ app.MapPost("/platform/remove", async (ModifyPlatformRequest req) =>
     }
 });
 
+// POST /platform/delete - Delete entire platform
+app.MapPost("/platform/delete", async (DeletePlatformRequest req) =>
+{
+    try
+    {
+        var docRef = db.Collection("platforms").Document("demo-platform");
+        var snapshot = await docRef.GetSnapshotAsync();
+        
+        if (!snapshot.Exists)
+        {
+            return Results.BadRequest(new { ok = false, error = "Platform not deployed" });
+        }
+
+        var data = snapshot.ToDictionary();
+        var allApps = ((List<object>)data["deployed_apps"]).Select(x => x.ToString()!.ToLowerInvariant()).ToList();
+
+        // Trigger Cloud Build to delete all apps
+        var result = await TriggerCloudBuild(projectId, triggerId, region, progressUrl,
+            req.Branch ?? "main",
+            string.Join(",", allApps),
+            "delete_platform");
+
+        if (!result.Success)
+            return Results.Problem(result.Error, statusCode: 500);
+
+        // Mark platform as deleting (will be fully deleted when build completes)
+        await docRef.UpdateAsync(new Dictionary<string, object>
+        {
+            ["status"] = "deleting",
+            ["last_modified"] = Timestamp.FromDateTime(DateTime.UtcNow)
+        });
+
+        return Results.Ok(new { ok = true, operation = result.Operation, action = "delete_platform" });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(ex.ToString(), statusCode: 500);
+    }
+});
+
 // Helper function
 static async Task<(bool Success, string? Operation, string? Error)> TriggerCloudBuild(
     string projectId, string triggerId, string region, string progressUrl,
@@ -449,11 +489,28 @@ app.MapGet("/status", async (HttpContext http, string operation) =>
             if (state == "SUCCESS")
             {
                 var docRef = db.Collection("platforms").Document("demo-platform");
-                await docRef.UpdateAsync(new Dictionary<string, object>
+                var snapshot = await docRef.GetSnapshotAsync();
+                
+                if (snapshot.Exists)
                 {
-                    ["status"] = "active",
-                    ["last_modified"] = Timestamp.FromDateTime(DateTime.UtcNow)
-                });
+                    var data = snapshot.ToDictionary();
+                    var status = data.ContainsKey("status") ? data["status"].ToString() : "";
+                    
+                    // If status is "deleting", delete the entire document
+                    if (status == "deleting")
+                    {
+                        await docRef.DeleteAsync();
+                    }
+                    else
+                    {
+                        // Otherwise just update status to "active"
+                        await docRef.UpdateAsync(new Dictionary<string, object>
+                        {
+                            ["status"] = "active",
+                            ["last_modified"] = Timestamp.FromDateTime(DateTime.UtcNow)
+                        });
+                    }
+                }
             }
         }
 
@@ -479,3 +536,4 @@ app.Run();
 public record RunRequest(string Targets, string Branch);
 public record DeployPlatformRequest(string[] Apps, string? Branch);
 public record ModifyPlatformRequest(string[] Apps, string? Branch);
+public record DeletePlatformRequest(string? Branch);

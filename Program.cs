@@ -1,5 +1,6 @@
-// Program.cs
+// Program.cs - Extended with Firestore platform management
 using Google.Apis.Auth.OAuth2;
+using Google.Cloud.Firestore;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
@@ -12,6 +13,10 @@ string projectId   = builder.Configuration["Gcp:ProjectId"]   ?? Environment.Get
 string triggerId   = builder.Configuration["Gcp:TriggerId"]   ?? Environment.GetEnvironmentVariable("TRIGGER_ID")   ?? "";
 string region      = builder.Configuration["Gcp:Region"]      ?? Environment.GetEnvironmentVariable("REGION")       ?? "global";
 string progressUrl = builder.Configuration["Gcp:ProgressUrl"] ?? Environment.GetEnvironmentVariable("PROGRESS_URL") ?? "";
+
+// === Firestore Setup ===
+Environment.SetEnvironmentVariable("GOOGLE_CLOUD_PROJECT", projectId);
+FirestoreDb db = FirestoreDb.Create(projectId);
 
 // CORS for local UI
 builder.Services.AddCors(opt =>
@@ -29,9 +34,6 @@ app.UseCors("ui");
 
 // === In-memory live store (fed by /progress) ===
 var stepStore = new ConcurrentDictionary<string, ConcurrentDictionary<string, string>>();
-// key: buildId ; value: stepId(lower) -> "START" | "DONE" | "FAIL"
-
-// live logs (last 200 lines / build)
 var logStore  = new ConcurrentDictionary<string, ConcurrentQueue<string>>();
 
 static void EnqueueLog(ConcurrentDictionary<string, ConcurrentQueue<string>> store, string buildId, string line)
@@ -41,8 +43,8 @@ static void EnqueueLog(ConcurrentDictionary<string, ConcurrentQueue<string>> sto
     while (q.Count > 200 && q.TryDequeue(out _)) { }
 }
 
-// FIX: Adaugă artifactory și github în stepOrder!
 string[] stepOrder = new[] { "frontend", "backend", "gitea", "confluence", "jira", "artifactory", "github" };
+string[] requiredApps = new[] { "frontend", "backend" }; // Always required
 
 static string N(string? s) => (s ?? "").Trim().ToLowerInvariant();
 static int Rank(string s) => (N(s)) switch
@@ -63,51 +65,192 @@ static string NormalizeLive(string s) => (N(s)) switch
 
 // --- Health & debug ---
 app.MapGet("/healthz", () => Results.Ok("ok"));
-app.MapGet("/routes", (IEnumerable<EndpointDataSource> sources) =>
+
+// ===================================
+// PLATFORM MANAGEMENT ENDPOINTS
+// ===================================
+
+// GET /platform - Get current platform state
+app.MapGet("/platform", async () =>
 {
-    var all = sources.SelectMany(s => s.Endpoints)
-                     .OfType<RouteEndpoint>()
-                     .Select(e => new
-                     {
-                         Route = e.RoutePattern.RawText,
-                         Methods = string.Join(",", e.Metadata.OfType<HttpMethodMetadata>().SelectMany(m => m.HttpMethods))
-                     });
-    return Results.Ok(all);
+    try
+    {
+        var docRef = db.Collection("platforms").Document("demo-platform");
+        var snapshot = await docRef.GetSnapshotAsync();
+        
+        if (!snapshot.Exists)
+        {
+            return Results.Ok(new
+            {
+                id = "demo-platform",
+                deployed_apps = Array.Empty<string>(),
+                created_at = (DateTime?)null,
+                last_modified = (DateTime?)null,
+                status = "not_deployed"
+            });
+        }
+
+        var data = snapshot.ToDictionary();
+        return Results.Ok(new
+        {
+            id = snapshot.Id,
+            deployed_apps = data.ContainsKey("deployed_apps") ? ((List<object>)data["deployed_apps"]).Select(x => x.ToString()).ToArray() : Array.Empty<string>(),
+            created_at = data.ContainsKey("created_at") ? ((Timestamp)data["created_at"]).ToDateTime() : (DateTime?)null,
+            last_modified = data.ContainsKey("last_modified") ? ((Timestamp)data["last_modified"]).ToDateTime() : (DateTime?)null,
+            status = data.ContainsKey("status") ? data["status"].ToString() : "unknown"
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(ex.ToString(), statusCode: 500);
+    }
 });
 
-// --- /progress (callbacks from Cloud Build) ---
-// POST /progress?op=$BUILD_ID&step=frontend&status=START|DONE|FAIL
-app.MapPost("/progress", (HttpRequest req) =>
+// POST /platform/deploy - Full platform deployment
+app.MapPost("/platform/deploy", async (DeployPlatformRequest req) =>
 {
-    var buildId = req.Query["op"].ToString();
-    var step    = N(req.Query["step"].ToString());
-    var status  = req.Query["status"].ToString();
+    try
+    {
+        var apps = req.Apps.Select(a => a.ToLowerInvariant()).ToList();
+        if (!apps.Contains("frontend") || !apps.Contains("backend"))
+        {
+            return Results.BadRequest(new { ok = false, error = "Frontend and Backend are required" });
+        }
 
-    if (string.IsNullOrWhiteSpace(buildId) || string.IsNullOrWhiteSpace(step))
-        return Results.BadRequest(new { ok = false, error = "missing op/step" });
+        var docRef = db.Collection("platforms").Document("demo-platform");
+        await docRef.SetAsync(new Dictionary<string, object>
+        {
+            ["deployed_apps"] = apps,
+            ["created_at"] = Timestamp.FromDateTime(DateTime.UtcNow),
+            ["last_modified"] = Timestamp.FromDateTime(DateTime.UtcNow),
+            ["status"] = "deploying"
+        });
 
-    var map = stepStore.GetOrAdd(buildId, _ => new ConcurrentDictionary<string, string>());
-    var incoming = NormalizeLive(status);
-    map.AddOrUpdate(step, incoming, (_, prev) => Rank(incoming) >= Rank(prev) ? incoming : prev);
+        var result = await TriggerCloudBuild(projectId, triggerId, region, progressUrl, 
+            req.Branch ?? "main", 
+            string.Join(",", apps), 
+            "deploy_platform");
 
-    // log live
-    EnqueueLog(logStore, buildId, $"[{step}] {(status ?? "START").ToUpperInvariant()}");
+        if (!result.Success)
+            return Results.Problem(result.Error, statusCode: 500);
 
-    return Results.Ok(new { ok = true });
+        return Results.Ok(new { ok = true, operation = result.Operation, action = "deploy_platform" });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(ex.ToString(), statusCode: 500);
+    }
 });
 
-// Preflight
-app.MapMethods("/run", new[] { "OPTIONS" }, () => Results.Ok());
-
-// GET /run (diagnostic)
-app.MapGet("/run", () => Results.Ok("run-get-ok"));
-
-// --- /run: start Cloud Build trigger ---
-app.MapPost("/run", async (RunRequest req) =>
+// POST /platform/add - Add apps to existing platform
+app.MapPost("/platform/add", async (ModifyPlatformRequest req) =>
 {
-    if (string.IsNullOrWhiteSpace(projectId) || string.IsNullOrWhiteSpace(triggerId))
-        return Results.BadRequest(new { ok = false, error = "Set PROJECT_ID și TRIGGER_ID" });
+    try
+    {
+        var docRef = db.Collection("platforms").Document("demo-platform");
+        var snapshot = await docRef.GetSnapshotAsync();
+        
+        if (!snapshot.Exists)
+        {
+            return Results.BadRequest(new { ok = false, error = "Platform not deployed yet. Use 'Deploy Platform' first." });
+        }
 
+        var data = snapshot.ToDictionary();
+        var currentApps = ((List<object>)data["deployed_apps"]).Select(x => x.ToString()!.ToLowerInvariant()).ToList();
+        
+        var appsToAdd = req.Apps.Select(a => a.ToLowerInvariant()).Where(a => !currentApps.Contains(a)).ToList();
+        
+        if (appsToAdd.Count == 0)
+        {
+            return Results.BadRequest(new { ok = false, error = "All selected apps are already deployed" });
+        }
+
+        currentApps.AddRange(appsToAdd);
+
+        await docRef.UpdateAsync(new Dictionary<string, object>
+        {
+            ["deployed_apps"] = currentApps,
+            ["last_modified"] = Timestamp.FromDateTime(DateTime.UtcNow),
+            ["status"] = "updating"
+        });
+
+        var result = await TriggerCloudBuild(projectId, triggerId, region, progressUrl,
+            req.Branch ?? "main",
+            string.Join(",", appsToAdd),
+            "add_app");
+
+        if (!result.Success)
+            return Results.Problem(result.Error, statusCode: 500);
+
+        return Results.Ok(new { ok = true, operation = result.Operation, action = "add_app", added = appsToAdd });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(ex.ToString(), statusCode: 500);
+    }
+});
+
+// POST /platform/remove - Remove apps from platform
+app.MapPost("/platform/remove", async (ModifyPlatformRequest req) =>
+{
+    try
+    {
+        var docRef = db.Collection("platforms").Document("demo-platform");
+        var snapshot = await docRef.GetSnapshotAsync();
+        
+        if (!snapshot.Exists)
+        {
+            return Results.BadRequest(new { ok = false, error = "Platform not deployed" });
+        }
+
+        var data = snapshot.ToDictionary();
+        var currentApps = ((List<object>)data["deployed_apps"]).Select(x => x.ToString()!.ToLowerInvariant()).ToList();
+        
+        var appsToRemove = req.Apps.Select(a => a.ToLowerInvariant()).ToList();
+        var blockedApps = appsToRemove.Where(a => requiredApps.Contains(a)).ToList();
+        
+        if (blockedApps.Any())
+        {
+            return Results.BadRequest(new { ok = false, error = $"Cannot remove required apps: {string.Join(", ", blockedApps)}" });
+        }
+
+        var validRemoves = appsToRemove.Where(a => currentApps.Contains(a)).ToList();
+        
+        if (validRemoves.Count == 0)
+        {
+            return Results.BadRequest(new { ok = false, error = "None of the selected apps are currently deployed" });
+        }
+
+        currentApps.RemoveAll(a => validRemoves.Contains(a));
+
+        await docRef.UpdateAsync(new Dictionary<string, object>
+        {
+            ["deployed_apps"] = currentApps,
+            ["last_modified"] = Timestamp.FromDateTime(DateTime.UtcNow),
+            ["status"] = "updating"
+        });
+
+        var result = await TriggerCloudBuild(projectId, triggerId, region, progressUrl,
+            req.Branch ?? "main",
+            string.Join(",", validRemoves),
+            "remove_app");
+
+        if (!result.Success)
+            return Results.Problem(result.Error, statusCode: 500);
+
+        return Results.Ok(new { ok = true, operation = result.Operation, action = "remove_app", removed = validRemoves });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(ex.ToString(), statusCode: 500);
+    }
+});
+
+// Helper function
+static async Task<(bool Success, string? Operation, string? Error)> TriggerCloudBuild(
+    string projectId, string triggerId, string region, string progressUrl,
+    string branch, string targets, string action)
+{
     try
     {
         var credential = await GoogleCredential.GetApplicationDefaultAsync();
@@ -115,11 +258,11 @@ app.MapPost("/run", async (RunRequest req) =>
         var token = await scoped.UnderlyingCredential.GetAccessTokenForRequestAsync();
 
         var url = $"https://cloudbuild.googleapis.com/v1/projects/{projectId}/locations/{region}/triggers/{triggerId}:run";
-        var branch = string.IsNullOrWhiteSpace(req.Branch) ? "main" : req.Branch;
 
         var subs = new Dictionary<string, string?>
         {
-            ["_TARGETS"] = string.IsNullOrWhiteSpace(req.Targets) ? "frontend,backend" : req.Targets
+            ["_TARGETS"] = targets,
+            ["_ACTION"] = action
         };
         if (!string.IsNullOrWhiteSpace(progressUrl))
             subs["_PROGRESS_URL"] = progressUrl;
@@ -141,23 +284,59 @@ app.MapPost("/run", async (RunRequest req) =>
         var resp = await http.PostAsync(url, new StringContent(json, Encoding.UTF8, "application/json"));
         var text = await resp.Content.ReadAsStringAsync();
 
-        if (!resp.IsSuccessStatusCode) return Results.Problem(text, statusCode: (int)resp.StatusCode);
+        if (!resp.IsSuccessStatusCode)
+            return (false, null, text);
 
         using var doc = JsonDocument.Parse(text);
         string? opName = doc.RootElement.TryGetProperty("name", out var n) ? n.GetString() : null;
 
-        return Results.Ok(new { ok = true, operation = opName });
+        return (true, opName, null);
     }
     catch (Exception ex)
     {
-        return Results.Problem(ex.ToString(), statusCode: 500);
+        return (false, null, ex.ToString());
     }
+}
+
+// --- /progress (callbacks from Cloud Build) ---
+app.MapPost("/progress", (HttpRequest req) =>
+{
+    var buildId = req.Query["op"].ToString();
+    var step    = N(req.Query["step"].ToString());
+    var status  = req.Query["status"].ToString();
+
+    if (string.IsNullOrWhiteSpace(buildId) || string.IsNullOrWhiteSpace(step))
+        return Results.BadRequest(new { ok = false, error = "missing op/step" });
+
+    var map = stepStore.GetOrAdd(buildId, _ => new ConcurrentDictionary<string, string>());
+    var incoming = NormalizeLive(status);
+    map.AddOrUpdate(step, incoming, (_, prev) => Rank(incoming) >= Rank(prev) ? incoming : prev);
+
+    EnqueueLog(logStore, buildId, $"[{step}] {(status ?? "START").ToUpperInvariant()}");
+
+    return Results.Ok(new { ok = true });
 });
 
-// --- /status: merge Cloud Build + live overlay (show only canonical steps) ---
-// FIX pentru Program.cs - înlocuiește endpoint-ul /status
-// Linia aproximativ 157-341
+app.MapMethods("/run", new[] { "OPTIONS" }, () => Results.Ok());
+app.MapGet("/run", () => Results.Ok("run-get-ok"));
 
+app.MapPost("/run", async (RunRequest req) =>
+{
+    if (string.IsNullOrWhiteSpace(projectId) || string.IsNullOrWhiteSpace(triggerId))
+        return Results.BadRequest(new { ok = false, error = "Set PROJECT_ID and TRIGGER_ID" });
+
+    var result = await TriggerCloudBuild(projectId, triggerId, region, progressUrl,
+        req.Branch ?? "main",
+        req.Targets ?? "frontend,backend",
+        "deploy_platform");
+
+    if (!result.Success)
+        return Results.Problem(result.Error, statusCode: 500);
+
+    return Results.Ok(new { ok = true, operation = result.Operation });
+});
+
+// GET /status
 app.MapGet("/status", async (HttpContext http, string operation) =>
 {
     try
@@ -168,7 +347,6 @@ app.MapGet("/status", async (HttpContext http, string operation) =>
         var scoped = credential.CreateScoped("https://www.googleapis.com/auth/cloud-platform");
         var token = await scoped.UnderlyingCredential.GetAccessTokenForRequestAsync();
 
-        // normalize operation path
         var opPath =
             operation.StartsWith("projects/", StringComparison.OrdinalIgnoreCase)   ? operation :
             operation.StartsWith("operations/", StringComparison.OrdinalIgnoreCase) ? operation :
@@ -188,14 +366,12 @@ app.MapGet("/status", async (HttpContext http, string operation) =>
         bool done = root.TryGetProperty("done", out var doneEl) && doneEl.GetBoolean();
         string state = "UNKNOWN";
         string? logUrl = null;
-        string? buildId = null; // <-- CRUCIAL: extrage din metadata, nu din path
+        string? buildId = null;
 
         var merged = new Dictionary<string, string>();
 
-        // 1) Extract build info from metadata
         if (root.TryGetProperty("metadata", out var metadata))
         {
-            // Extract buildId from metadata.build.id
             if (metadata.TryGetProperty("build", out var buildEl) &&
                 buildEl.TryGetProperty("id", out var idEl))
             {
@@ -204,15 +380,12 @@ app.MapGet("/status", async (HttpContext http, string operation) =>
 
             if (buildEl.ValueKind != JsonValueKind.Undefined)
             {
-                // status
                 if (buildEl.TryGetProperty("status", out var statusEl))
                     state = statusEl.GetString()?.ToUpperInvariant() ?? "UNKNOWN";
 
-                // logUrl
                 if (buildEl.TryGetProperty("logUrl", out var logUrlEl))
                     logUrl = logUrlEl.GetString();
 
-                // canonical steps
                 if (buildEl.TryGetProperty("steps", out var stepsEl) && stepsEl.ValueKind == JsonValueKind.Array)
                 {
                     foreach (var step in stepsEl.EnumerateArray())
@@ -235,7 +408,6 @@ app.MapGet("/status", async (HttpContext http, string operation) =>
             }
         }
 
-        // 2) Overlay live progress from callbacks (if buildId found)
         if (!string.IsNullOrEmpty(buildId) && stepStore.TryGetValue(buildId, out var liveMap))
         {
             foreach (var kv in liveMap)
@@ -247,13 +419,11 @@ app.MapGet("/status", async (HttpContext http, string operation) =>
             }
         }
 
-        // 3) Build ordered list for UI
         var stepsOut = new List<object>();
         foreach (var id in stepOrder)
             if (merged.TryGetValue(id, out var stCanon))
                 stepsOut.Add(new { id, status = stCanon });
 
-        // 4) Percent
         int total = stepsOut.Count;
         int finished = stepsOut.Count(x =>
         {
@@ -261,42 +431,30 @@ app.MapGet("/status", async (HttpContext http, string operation) =>
             return stCanon is "SUCCESS" or "FAILURE" or "CANCELLED" or "INTERNAL_ERROR" or "TIMEOUT";
         });
 
-        int percent;
-        if (total > 0)
-        {
-            percent = (int)Math.Round((finished * 100.0) / Math.Max(1, total));
-            if (!done && percent >= 100) percent = 99;
-        }
-        else
-        {
-            percent = state switch
-            {
-                "QUEUED"  => 5,
-                "WORKING" => 50,
-                "SUCCESS" => 100,
-                "FAILURE" or "CANCELLED" or "INTERNAL_ERROR" or "TIMEOUT" => 100,
-                _ => 0
-            };
-        }
+        int percent = total > 0 ? (int)Math.Round((finished * 100.0) / Math.Max(1, total)) : 0;
+        if (!done && percent >= 100) percent = 99;
         if (done && state == "SUCCESS") percent = 100;
 
-        // 5) Live events (din logStore) - ACUM VA FUNCȚIONA!
         var eventsOut = new List<string>();
         if (!string.IsNullOrEmpty(buildId) && logStore.TryGetValue(buildId, out var q))
         {
             eventsOut = q.ToList();
-            Console.WriteLine($"[DEBUG] Found {eventsOut.Count} events for buildId: {buildId}");
-        }
-        else
-        {
-            Console.WriteLine($"[DEBUG] No events found for buildId: {buildId ?? "(null)"}");
         }
 
-        // cleanup memory when finished
         if (done && !string.IsNullOrEmpty(buildId))
         {
             stepStore.TryRemove(buildId, out _);
             logStore.TryRemove(buildId, out _);
+            
+            if (state == "SUCCESS")
+            {
+                var docRef = db.Collection("platforms").Document("demo-platform");
+                await docRef.UpdateAsync(new Dictionary<string, object>
+                {
+                    ["status"] = "active",
+                    ["last_modified"] = Timestamp.FromDateTime(DateTime.UtcNow)
+                });
+            }
         }
 
         return Results.Ok(new
@@ -307,129 +465,7 @@ app.MapGet("/status", async (HttpContext http, string operation) =>
             percent,
             logs = logUrl,
             steps = stepsOut,
-            events = eventsOut,
-            buildId = buildId // <-- ADAUGĂ PENTRU DEBUG
-        });
-    }
-    catch (Exception ex)
-    {
-        return Results.Problem(ex.ToString(), statusCode: 500);
-    }
-});
-
-// --- /logs: citește logurile Cloud Build din Cloud Logging (live/paginate) ---
-// GET /logs?operation=...&pageToken=...&since=2025-10-27T15:00:00Z
-app.MapGet("/logs", async (HttpContext http, string operation, string? pageToken, string? since) =>
-{
-    try
-    {
-        http.Response.Headers.CacheControl = "no-store";
-
-        static string NormalizeOp(string op, string projectId, string region)
-            => op.StartsWith("projects/", StringComparison.OrdinalIgnoreCase) || op.StartsWith("operations/", StringComparison.OrdinalIgnoreCase)
-               ? op
-               : $"projects/{projectId}/locations/{(string.IsNullOrWhiteSpace(region) ? "global" : region)}/operations/{op}";
-
-        var opPath = NormalizeOp(operation, projectId, region);
-
-        string? buildId = null;
-        if (opPath.StartsWith("operations/build/", StringComparison.OrdinalIgnoreCase))
-        {
-            var parts = opPath.Split('/', StringSplitOptions.RemoveEmptyEntries);
-            if (parts.Length >= 4) buildId = parts[^1];
-        }
-
-        if (string.IsNullOrEmpty(buildId))
-        {
-            var cred0 = await GoogleCredential.GetApplicationDefaultAsync();
-            var scoped0 = cred0.CreateScoped("https://www.googleapis.com/auth/cloud-platform");
-            var token0 = await scoped0.UnderlyingCredential.GetAccessTokenForRequestAsync();
-
-            using var hc0 = new HttpClient();
-            hc0.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token0);
-            var getUrl = $"https://cloudbuild.googleapis.com/v1/{opPath}";
-            var r0 = await hc0.GetAsync(getUrl);
-            var t0 = await r0.Content.ReadAsStringAsync();
-            if (!r0.IsSuccessStatusCode) return Results.Problem(t0, statusCode: (int)r0.StatusCode);
-
-            using var d0 = JsonDocument.Parse(t0);
-            if (d0.RootElement.TryGetProperty("metadata", out var meta) &&
-                meta.TryGetProperty("build", out var build) &&
-                build.TryGetProperty("id", out var idEl))
-            {
-                buildId = idEl.GetString();
-            }
-        }
-
-        if (string.IsNullOrEmpty(buildId))
-            return Results.BadRequest(new { ok = false, error = "cannot resolve buildId" });
-
-        var cred = await GoogleCredential.GetApplicationDefaultAsync();
-        var scoped = cred.CreateScoped(new[]
-        {
-            "https://www.googleapis.com/auth/cloud-platform",
-            "https://www.googleapis.com/auth/logging.read"
-        });
-        var token = await scoped.UnderlyingCredential.GetAccessTokenForRequestAsync();
-
-        var filter = $"resource.type=\"build\" AND labels.build_id=\"{buildId}\"";
-        if (!string.IsNullOrWhiteSpace(since) && DateTimeOffset.TryParse(since, out var sinceTs))
-        {
-            var iso = sinceTs.UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'");
-            filter += $" AND timestamp>=\"{iso}\"";
-        }
-
-        var body = new
-        {
-            resourceNames = new[] { $"projects/{projectId}" },
-            filter,
-            orderBy = "timestamp asc",
-            pageSize = 500,
-            pageToken = pageToken
-        };
-
-        using var httpClient = new HttpClient();
-        httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
-        var json = JsonSerializer.Serialize(body);
-        var resp = await httpClient.PostAsync(
-            "https://logging.googleapis.com/v2/entries:list",
-            new StringContent(json, Encoding.UTF8, "application/json"));
-
-        var text = await resp.Content.ReadAsStringAsync();
-        if (!resp.IsSuccessStatusCode) return Results.Problem(text, statusCode: (int)resp.StatusCode);
-
-        using var doc = JsonDocument.Parse(text);
-        var arr = new List<object>();
-        string? next = null;
-
-        if (doc.RootElement.TryGetProperty("entries", out var entries) && entries.ValueKind == JsonValueKind.Array)
-        {
-            foreach (var e in entries.EnumerateArray())
-            {
-                string ts =
-                    e.TryGetProperty("timestamp", out var tsEl) ? tsEl.GetString() ?? "" : "";
-                string line =
-                    e.TryGetProperty("textPayload", out var tp) ? tp.GetString() ?? "" :
-                    e.TryGetProperty("jsonPayload", out var jp) && jp.TryGetProperty("message", out var msg) ? msg.GetString() ?? "" :
-                    e.TryGetProperty("protoPayload", out var pp) && pp.TryGetProperty("@type", out var _) ? pp.ToString() :
-                    e.ToString();
-
-                foreach (var ln in (line ?? "").Replace("\r\n","\n").Split('\n'))
-                {
-                    if (!string.IsNullOrEmpty(ln))
-                        arr.Add(new { ts, line = ln });
-                }
-            }
-        }
-        if (doc.RootElement.TryGetProperty("nextPageToken", out var npt))
-            next = npt.GetString();
-
-        return Results.Ok(new
-        {
-            ok = true,
-            buildId,
-            nextPageToken = next,
-            entries = arr
+            events = eventsOut
         });
     }
     catch (Exception ex)
@@ -440,5 +476,6 @@ app.MapGet("/logs", async (HttpContext http, string operation, string? pageToken
 
 app.Run();
 
-// DTO for /run
 public record RunRequest(string Targets, string Branch);
+public record DeployPlatformRequest(string[] Apps, string? Branch);
+public record ModifyPlatformRequest(string[] Apps, string? Branch);

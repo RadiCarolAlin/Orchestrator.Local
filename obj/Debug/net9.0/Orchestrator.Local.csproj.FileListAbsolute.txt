@@ -69,3 +69,17 @@ D:\proiect lucru\Orchestrator.Local\obj\Debug\net9.0\refint\Orchestrator.Local.d
 D:\proiect lucru\Orchestrator.Local\obj\Debug\net9.0\Orchestrator.Local.pdb
 D:\proiect lucru\Orchestrator.Local\obj\Debug\net9.0\Orchestrator.Local.genruntimeconfig.cache
 D:\proiect lucru\Orchestrator.Local\obj\Debug\net9.0\ref\Orchestrator.Local.dll
+D:\proiect lucru\Orchestrator.Local\bin\Debug\net9.0\Google.Api.CommonProtos.dll
+D:\proiect lucru\Orchestrator.Local\bin\Debug\net9.0\Google.Api.Gax.dll
+D:\proiect lucru\Orchestrator.Local\bin\Debug\net9.0\Google.Api.Gax.Grpc.dll
+D:\proiect lucru\Orchestrator.Local\bin\Debug\net9.0\Google.Cloud.Firestore.dll
+D:\proiect lucru\Orchestrator.Local\bin\Debug\net9.0\Google.Cloud.Firestore.V1.dll
+D:\proiect lucru\Orchestrator.Local\bin\Debug\net9.0\Google.Cloud.Location.dll
+D:\proiect lucru\Orchestrator.Local\bin\Debug\net9.0\Google.LongRunning.dll
+D:\proiect lucru\Orchestrator.Local\bin\Debug\net9.0\Google.Protobuf.dll
+D:\proiect lucru\Orchestrator.Local\bin\Debug\net9.0\Grpc.Auth.dll
+D:\proiect lucru\Orchestrator.Local\bin\Debug\net9.0\Grpc.Core.Api.dll
+D:\proiect lucru\Orchestrator.Local\bin\Debug\net9.0\Grpc.Net.Client.dll
+D:\proiect lucru\Orchestrator.Local\bin\Debug\net9.0\Grpc.Net.Common.dll
+D:\proiect lucru\Orchestrator.Local\bin\Debug\net9.0\Microsoft.Bcl.AsyncInterfaces.dll
+D:\proiect lucru\Orchestrator.Local\bin\Debug\net9.0\System.Linq.Async.dll

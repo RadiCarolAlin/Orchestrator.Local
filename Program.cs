@@ -339,7 +339,7 @@ static async Task<(bool Success, string? Operation, string? Error)> TriggerCloud
 }
 
 // --- /progress (callbacks from Cloud Build) ---
-app.MapPost("/progress", (HttpRequest req) =>
+app.MapPost("/progress/progress", (HttpRequest req) =>
 {
     var buildId = req.Query["op"].ToString();
     var step    = N(req.Query["step"].ToString());

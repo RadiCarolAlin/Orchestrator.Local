@@ -129,7 +129,9 @@ app.MapPost("/platform/deploy", async (DeployPlatformRequest req) =>
         var result = await TriggerCloudBuild(projectId, triggerId, region, progressUrl, 
             req.Branch ?? "main", 
             string.Join(",", apps), 
-            "deploy_platform");
+            "deploy_platform",
+            req.Namespace,
+            req.UserEmail);
 
         if (!result.Success)
             return Results.Problem(result.Error, statusCode: 500);
@@ -289,7 +291,7 @@ app.MapPost("/platform/delete", async (DeletePlatformRequest req) =>
 // Helper function
 static async Task<(bool Success, string? Operation, string? Error)> TriggerCloudBuild(
     string projectId, string triggerId, string region, string progressUrl,
-    string branch, string targets, string action)
+    string branch, string targets, string action, string? namespaceParam = null, string? userEmail = null)
 {
     try
     {
@@ -306,6 +308,10 @@ static async Task<(bool Success, string? Operation, string? Error)> TriggerCloud
         };
         if (!string.IsNullOrWhiteSpace(progressUrl))
             subs["_PROGRESS_URL"] = progressUrl;
+        if (!string.IsNullOrWhiteSpace(namespaceParam))
+            subs["_NAMESPACE"] = namespaceParam;
+        if (!string.IsNullOrWhiteSpace(userEmail))
+            subs["_USER_EMAIL"] = userEmail;
 
         var body = new
         {
@@ -318,6 +324,11 @@ static async Task<(bool Success, string? Operation, string? Error)> TriggerCloud
             }
         };
 
+        // Log the request for debugging
+        var bodyJson = JsonSerializer.Serialize(body, new JsonSerializerOptions { WriteIndented = true });
+        Console.WriteLine("📤 Sending to Cloud Build API:");
+        Console.WriteLine(bodyJson);
+
         using var http = new HttpClient();
         http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
         var json = JsonSerializer.Serialize(body);
@@ -325,11 +336,15 @@ static async Task<(bool Success, string? Operation, string? Error)> TriggerCloud
         var text = await resp.Content.ReadAsStringAsync();
 
         if (!resp.IsSuccessStatusCode)
+        {
+            Console.WriteLine($"❌ Cloud Build API Error: {text}");
             return (false, null, text);
+        }
 
         using var doc = JsonDocument.Parse(text);
         string? opName = doc.RootElement.TryGetProperty("name", out var n) ? n.GetString() : null;
 
+        Console.WriteLine($"✅ Cloud Build started successfully. Operation: {opName}");
         return (true, opName, null);
     }
     catch (Exception ex)
@@ -534,6 +549,6 @@ app.MapGet("/status", async (HttpContext http, string operation) =>
 app.Run();
 
 public record RunRequest(string Targets, string Branch);
-public record DeployPlatformRequest(string[] Apps, string? Branch);
+public record DeployPlatformRequest(string[] Apps, string? Branch, string? Namespace, string? UserEmail);
 public record ModifyPlatformRequest(string[] Apps, string? Branch);
 public record DeletePlatformRequest(string? Branch);

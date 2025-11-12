@@ -5,6 +5,7 @@ using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
 using System.Collections.Concurrent;
+using System.Linq;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -70,20 +71,59 @@ app.MapGet("/healthz", () => Results.Ok("ok"));
 // PLATFORM MANAGEMENT ENDPOINTS
 // ===================================
 
-// GET /platform - Get current platform state
+// NEW: GET /platforms - List all platforms
+app.MapGet("/platforms", async () =>
+{
+    try
+    {
+        var snapshot = await db.Collection("platforms").GetSnapshotAsync();
+        var platforms = new List<object>();
+
+        foreach (var doc in snapshot.Documents)
+        {
+            var data = doc.ToDictionary();
+            platforms.Add(new
+            {
+                id = doc.Id,
+                namespace_name = doc.Id,
+                deployed_apps = data.ContainsKey("deployed_apps")
+                    ? ((List<object>)data["deployed_apps"]).Select(x => x.ToString()).ToArray()
+                    : Array.Empty<string>(),
+                user_email = data.ContainsKey("user_email") ? data["user_email"].ToString() : "",
+                created_at = data.ContainsKey("created_at")
+                    ? ((Timestamp)data["created_at"]).ToDateTime()
+                    : (DateTime?)null,
+                last_modified = data.ContainsKey("last_modified")
+                    ? ((Timestamp)data["last_modified"]).ToDateTime()
+                    : (DateTime?)null,
+                status = data.ContainsKey("status") ? data["status"].ToString() : "unknown"
+            });
+        }
+
+        return Results.Ok(platforms);
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(ex.ToString(), statusCode: 500);
+    }
+});
+
+// GET /platform - Get current platform state (kept for backward compatibility)
 app.MapGet("/platform", async () =>
 {
     try
     {
         var docRef = db.Collection("platforms").Document("demo-platform");
         var snapshot = await docRef.GetSnapshotAsync();
-        
+
         if (!snapshot.Exists)
         {
             return Results.Ok(new
             {
                 id = "demo-platform",
+                namespace_name = "demo-platform",
                 deployed_apps = Array.Empty<string>(),
+                user_email = "",
                 created_at = (DateTime?)null,
                 last_modified = (DateTime?)null,
                 status = "not_deployed"
@@ -94,7 +134,11 @@ app.MapGet("/platform", async () =>
         return Results.Ok(new
         {
             id = snapshot.Id,
-            deployed_apps = data.ContainsKey("deployed_apps") ? ((List<object>)data["deployed_apps"]).Select(x => x.ToString()).ToArray() : Array.Empty<string>(),
+            namespace_name = snapshot.Id,
+            deployed_apps = data.ContainsKey("deployed_apps")
+                ? ((List<object>)data["deployed_apps"]).Select(x => x.ToString()).ToArray()
+                : Array.Empty<string>(),
+            user_email = data.ContainsKey("user_email") ? data["user_email"].ToString() : "",
             created_at = data.ContainsKey("created_at") ? ((Timestamp)data["created_at"]).ToDateTime() : (DateTime?)null,
             last_modified = data.ContainsKey("last_modified") ? ((Timestamp)data["last_modified"]).ToDateTime() : (DateTime?)null,
             status = data.ContainsKey("status") ? data["status"].ToString() : "unknown"
@@ -111,24 +155,58 @@ app.MapPost("/platform/deploy", async (DeployPlatformRequest req) =>
 {
     try
     {
+        // Validate namespace
+        if (string.IsNullOrWhiteSpace(req.Namespace))
+        {
+            return Results.BadRequest(new { ok = false, error = "Namespace is required" });
+        }
+
         var apps = req.Apps.Select(a => a.ToLowerInvariant()).ToList();
+
+        // Log deployment details
+        Console.WriteLine("🚀 Starting deploy with apps: [{0}]", string.Join(", ", apps));
+        Console.WriteLine("📦 Namespace: {0}", req.Namespace);
+        Console.WriteLine("👤 User: {0}", req.UserEmail ?? "<not provided>");
+
         if (!apps.Contains("frontend") || !apps.Contains("backend"))
         {
             return Results.BadRequest(new { ok = false, error = "Frontend and Backend are required" });
         }
 
-        var docRef = db.Collection("platforms").Document("demo-platform");
+        // Use namespace as document ID
+        var docRef = db.Collection("platforms").Document(req.Namespace);
+        var snapshot = await docRef.GetSnapshotAsync();
+
+        // Check if platform already exists and is active
+        if (snapshot.Exists)
+        {
+            var data = snapshot.ToDictionary();
+            var status = data.ContainsKey("status") ? data["status"].ToString() : "";
+
+            if (status == "active" || status == "deploying" || status == "updating")
+            {
+                return Results.BadRequest(new
+                {
+                    ok = false,
+                    error = $"Platform '{req.Namespace}' already exists. Use 'Add Apps' or 'Remove Apps' to modify it, or delete it first."
+                });
+            }
+        }
+
+        // Create/update platform document
         await docRef.SetAsync(new Dictionary<string, object>
         {
+            ["namespace"] = req.Namespace,
             ["deployed_apps"] = apps,
+            ["user_email"] = req.UserEmail ?? "",
             ["created_at"] = Timestamp.FromDateTime(DateTime.UtcNow),
             ["last_modified"] = Timestamp.FromDateTime(DateTime.UtcNow),
             ["status"] = "deploying"
         });
 
-        var result = await TriggerCloudBuild(projectId, triggerId, region, progressUrl, 
-            req.Branch ?? "main", 
-            string.Join(",", apps), 
+        var result = await TriggerCloudBuild(projectId, triggerId, region, progressUrl,
+            req.Branch ?? "main",
+            string.Join(",", apps),
             "deploy_platform",
             req.Namespace,
             req.UserEmail);
@@ -136,7 +214,61 @@ app.MapPost("/platform/deploy", async (DeployPlatformRequest req) =>
         if (!result.Success)
             return Results.Problem(result.Error, statusCode: 500);
 
-        return Results.Ok(new { ok = true, operation = result.Operation, action = "deploy_platform" });
+        return Results.Ok(new { ok = true, operation = result.Operation, action = "deploy_platform", namespace_name = req.Namespace });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(ex.ToString(), statusCode: 500);
+    }
+});
+
+// GET /platform/{ns} - Get specific platform by namespace
+app.MapGet("/platform/{ns}", async (string ns) =>
+{
+    try
+    {
+        if (string.IsNullOrWhiteSpace(ns))
+        {
+            return Results.BadRequest(new { ok = false, error = "Namespace is required" });
+        }
+
+        var docRef = db.Collection("platforms").Document(ns);
+        var snapshot = await docRef.GetSnapshotAsync();
+
+        // IMPORTANT: dacă platforma nu există, întoarcem un stub not_deployed,
+        // NU 404, ca să nu rupem UI-ul (loadPlatform să nu dea eroare).
+        if (!snapshot.Exists)
+        {
+            return Results.Ok(new
+            {
+                id = ns,
+                namespace_name = ns,
+                deployed_apps = Array.Empty<string>(),
+                user_email = "",
+                created_at = (DateTime?)null,
+                last_modified = (DateTime?)null,
+                status = "not_deployed"
+            });
+        }
+
+        var data = snapshot.ToDictionary();
+
+        return Results.Ok(new
+        {
+            id = snapshot.Id,
+            namespace_name = snapshot.Id,
+            deployed_apps = data.ContainsKey("deployed_apps")
+                ? ((List<object>)data["deployed_apps"]).Select(x => x.ToString()).ToArray()
+                : Array.Empty<string>(),
+            user_email = data.ContainsKey("user_email") ? data["user_email"]?.ToString() : "",
+            created_at = data.ContainsKey("created_at")
+                ? ((Timestamp)data["created_at"]).ToDateTime()
+                : (DateTime?)null,
+            last_modified = data.ContainsKey("last_modified")
+                ? ((Timestamp)data["last_modified"]).ToDateTime()
+                : (DateTime?)null,
+            status = data.ContainsKey("status") ? data["status"]?.ToString() : "unknown"
+        });
     }
     catch (Exception ex)
     {
@@ -149,19 +281,24 @@ app.MapPost("/platform/add", async (ModifyPlatformRequest req) =>
 {
     try
     {
-        var docRef = db.Collection("platforms").Document("demo-platform");
+        if (string.IsNullOrWhiteSpace(req.Namespace))
+        {
+            return Results.BadRequest(new { ok = false, error = "Namespace is required" });
+        }
+
+        var docRef = db.Collection("platforms").Document(req.Namespace);
         var snapshot = await docRef.GetSnapshotAsync();
-        
+
         if (!snapshot.Exists)
         {
-            return Results.BadRequest(new { ok = false, error = "Platform not deployed yet. Use 'Deploy Platform' first." });
+            return Results.BadRequest(new { ok = false, error = $"Platform '{req.Namespace}' not found. Deploy it first." });
         }
 
         var data = snapshot.ToDictionary();
         var currentApps = ((List<object>)data["deployed_apps"]).Select(x => x.ToString()!.ToLowerInvariant()).ToList();
-        
+
         var appsToAdd = req.Apps.Select(a => a.ToLowerInvariant()).Where(a => !currentApps.Contains(a)).ToList();
-        
+
         if (appsToAdd.Count == 0)
         {
             return Results.BadRequest(new { ok = false, error = "All selected apps are already deployed" });
@@ -176,10 +313,13 @@ app.MapPost("/platform/add", async (ModifyPlatformRequest req) =>
             ["status"] = "updating"
         });
 
+        var userEmail = data.ContainsKey("user_email") ? data["user_email"].ToString() : null;
         var result = await TriggerCloudBuild(projectId, triggerId, region, progressUrl,
             req.Branch ?? "main",
             string.Join(",", appsToAdd),
-            "add_app");
+            "add_app",
+            req.Namespace,
+            userEmail);
 
         if (!result.Success)
             return Results.Problem(result.Error, statusCode: 500);
@@ -197,27 +337,32 @@ app.MapPost("/platform/remove", async (ModifyPlatformRequest req) =>
 {
     try
     {
-        var docRef = db.Collection("platforms").Document("demo-platform");
+        if (string.IsNullOrWhiteSpace(req.Namespace))
+        {
+            return Results.BadRequest(new { ok = false, error = "Namespace is required" });
+        }
+
+        var docRef = db.Collection("platforms").Document(req.Namespace);
         var snapshot = await docRef.GetSnapshotAsync();
-        
+
         if (!snapshot.Exists)
         {
-            return Results.BadRequest(new { ok = false, error = "Platform not deployed" });
+            return Results.BadRequest(new { ok = false, error = $"Platform '{req.Namespace}' not found" });
         }
 
         var data = snapshot.ToDictionary();
         var currentApps = ((List<object>)data["deployed_apps"]).Select(x => x.ToString()!.ToLowerInvariant()).ToList();
-        
+
         var appsToRemove = req.Apps.Select(a => a.ToLowerInvariant()).ToList();
         var blockedApps = appsToRemove.Where(a => requiredApps.Contains(a)).ToList();
-        
+
         if (blockedApps.Any())
         {
             return Results.BadRequest(new { ok = false, error = $"Cannot remove required apps: {string.Join(", ", blockedApps)}" });
         }
 
         var validRemoves = appsToRemove.Where(a => currentApps.Contains(a)).ToList();
-        
+
         if (validRemoves.Count == 0)
         {
             return Results.BadRequest(new { ok = false, error = "None of the selected apps are currently deployed" });
@@ -232,10 +377,13 @@ app.MapPost("/platform/remove", async (ModifyPlatformRequest req) =>
             ["status"] = "updating"
         });
 
+        var userEmail = data.ContainsKey("user_email") ? data["user_email"].ToString() : null;
         var result = await TriggerCloudBuild(projectId, triggerId, region, progressUrl,
             req.Branch ?? "main",
             string.Join(",", validRemoves),
-            "remove_app");
+            "remove_app",
+            req.Namespace,
+            userEmail);
 
         if (!result.Success)
             return Results.Problem(result.Error, statusCode: 500);
@@ -253,22 +401,29 @@ app.MapPost("/platform/delete", async (DeletePlatformRequest req) =>
 {
     try
     {
-        var docRef = db.Collection("platforms").Document("demo-platform");
+        if (string.IsNullOrWhiteSpace(req.Namespace))
+        {
+            return Results.BadRequest(new { ok = false, error = "Namespace is required" });
+        }
+
+        var docRef = db.Collection("platforms").Document(req.Namespace);
         var snapshot = await docRef.GetSnapshotAsync();
-        
+
         if (!snapshot.Exists)
         {
-            return Results.BadRequest(new { ok = false, error = "Platform not deployed" });
+            return Results.BadRequest(new { ok = false, error = $"Platform '{req.Namespace}' not found" });
         }
 
         var data = snapshot.ToDictionary();
         var allApps = ((List<object>)data["deployed_apps"]).Select(x => x.ToString()!.ToLowerInvariant()).ToList();
 
-        // Trigger Cloud Build to delete all apps
+        var userEmail = data.ContainsKey("user_email") ? data["user_email"].ToString() : null;
         var result = await TriggerCloudBuild(projectId, triggerId, region, progressUrl,
             req.Branch ?? "main",
             string.Join(",", allApps),
-            "delete_platform");
+            "delete_platform",
+            req.Namespace,
+            userEmail);
 
         if (!result.Success)
             return Results.Problem(result.Error, statusCode: 500);
@@ -427,36 +582,36 @@ app.MapGet("/status", async (HttpContext http, string operation) =>
 
         if (root.TryGetProperty("metadata", out var metadata))
         {
-            if (metadata.TryGetProperty("build", out var buildEl) &&
-                buildEl.TryGetProperty("id", out var idEl))
+            if (metadata.TryGetProperty("build", out var buildEl))
             {
-                buildId = idEl.GetString();
-            }
+                if (buildEl.TryGetProperty("id", out var idEl))
+                    buildId = idEl.GetString();
 
-            if (buildEl.ValueKind != JsonValueKind.Undefined)
-            {
-                if (buildEl.TryGetProperty("status", out var statusEl))
-                    state = statusEl.GetString()?.ToUpperInvariant() ?? "UNKNOWN";
-
-                if (buildEl.TryGetProperty("logUrl", out var logUrlEl))
-                    logUrl = logUrlEl.GetString();
-
-                if (buildEl.TryGetProperty("steps", out var stepsEl) && stepsEl.ValueKind == JsonValueKind.Array)
+                if (buildEl.ValueKind != JsonValueKind.Undefined)
                 {
-                    foreach (var step in stepsEl.EnumerateArray())
+                    if (buildEl.TryGetProperty("status", out var statusEl))
+                        state = statusEl.GetString()?.ToUpperInvariant() ?? "UNKNOWN";
+
+                    if (buildEl.TryGetProperty("logUrl", out var logUrlEl))
+                        logUrl = logUrlEl.GetString();
+
+                    if (buildEl.TryGetProperty("steps", out var stepsEl) && stepsEl.ValueKind == JsonValueKind.Array)
                     {
-                        string? stepId = null;
-                        string? stepStatus = null;
-
-                        if (step.TryGetProperty("id", out var stepIdEl)) stepId = stepIdEl.GetString();
-                        if (step.TryGetProperty("status", out var stepStatusEl)) stepStatus = stepStatusEl.GetString();
-
-                        if (!string.IsNullOrWhiteSpace(stepId) && !string.IsNullOrWhiteSpace(stepStatus))
+                        foreach (var step in stepsEl.EnumerateArray())
                         {
-                            var norm = N(stepId);
-                            var incoming = stepStatus?.ToUpperInvariant() ?? "QUEUED";
-                            if (!merged.TryGetValue(norm, out var prev) || Rank(incoming) >= Rank(prev))
-                                merged[norm] = incoming;
+                            string? stepId = null;
+                            string? stepStatus = null;
+
+                            if (step.TryGetProperty("id", out var stepIdEl)) stepId = stepIdEl.GetString();
+                            if (step.TryGetProperty("status", out var stepStatusEl)) stepStatus = stepStatusEl.GetString();
+
+                            if (!string.IsNullOrWhiteSpace(stepId) && !string.IsNullOrWhiteSpace(stepStatus))
+                            {
+                                var norm = N(stepId);
+                                var incoming = stepStatus?.ToUpperInvariant() ?? "QUEUED";
+                                if (!merged.TryGetValue(norm, out var prev) || Rank(incoming) >= Rank(prev))
+                                    merged[norm] = incoming;
+                            }
                         }
                     }
                 }
@@ -500,26 +655,26 @@ app.MapGet("/status", async (HttpContext http, string operation) =>
         {
             stepStore.TryRemove(buildId, out _);
             logStore.TryRemove(buildId, out _);
-            
+
             if (state == "SUCCESS")
             {
-                var docRef = db.Collection("platforms").Document("demo-platform");
-                var snapshot = await docRef.GetSnapshotAsync();
-                
-                if (snapshot.Exists)
+                // Update all platforms that are in deploying/updating status
+                var platformsSnapshot = await db.Collection("platforms").GetSnapshotAsync();
+
+                foreach (var platformDoc in platformsSnapshot.Documents)
                 {
-                    var data = snapshot.ToDictionary();
+                    var data = platformDoc.ToDictionary();
                     var status = data.ContainsKey("status") ? data["status"].ToString() : "";
-                    
+
                     // If status is "deleting", delete the entire document
                     if (status == "deleting")
                     {
-                        await docRef.DeleteAsync();
+                        await platformDoc.Reference.DeleteAsync();
                     }
-                    else
+                    else if (status == "deploying" || status == "updating")
                     {
-                        // Otherwise just update status to "active"
-                        await docRef.UpdateAsync(new Dictionary<string, object>
+                        // Update status to "active"
+                        await platformDoc.Reference.UpdateAsync(new Dictionary<string, object>
                         {
                             ["status"] = "active",
                             ["last_modified"] = Timestamp.FromDateTime(DateTime.UtcNow)
@@ -550,5 +705,5 @@ app.Run();
 
 public record RunRequest(string Targets, string Branch);
 public record DeployPlatformRequest(string[] Apps, string? Branch, string? Namespace, string? UserEmail);
-public record ModifyPlatformRequest(string[] Apps, string? Branch);
-public record DeletePlatformRequest(string? Branch);
+public record ModifyPlatformRequest(string[] Apps, string? Branch, string? Namespace);
+public record DeletePlatformRequest(string? Branch, string? Namespace);

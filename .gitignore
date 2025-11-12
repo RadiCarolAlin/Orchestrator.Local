@@ -1,4 +1,17 @@
-.DS_Store
-node_modules/
+# Build artifacts
 bin/
 obj/
+*.pdb
+*.sourcelink.json
+*.cache
+
+# IDE
+.idea/
+.vscode/
+*.user
+*.suo
+*.userprefs
+*.DotSettings.user
+
+# Nu urca setări locale
+appsettings.*.local.json

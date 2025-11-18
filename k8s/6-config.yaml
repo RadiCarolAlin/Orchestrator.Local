@@ -1,0 +1,9 @@
+apiVersion: cloud.google.com/v1
+kind: BackendConfig
+metadata:
+  name: backendconfig-testing
+  namespace: aumovio-platform-deploy
+spec:
+  timeoutSec: 3600
+  connectionDraining:
+    drainingTimeoutSec: 30

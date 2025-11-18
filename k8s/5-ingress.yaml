@@ -6,6 +6,10 @@ metadata:
   annotations:
     kubernetes.io/ingress.class: "gce"
     kubernetes.io/ingress.global-static-ip-name: "aumovio-platform-ip"
+    kubernetes.io/ingress.allow-http: "true"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/websocket-services: "backendconfig-testing"
 spec:
   rules:
     - http:
@@ -38,7 +42,7 @@ spec:
                 name: backend-orchestrator
                 port:
                   number: 80
-          - path: /hub/deploy/
+          - path: /hub/deploy
             pathType: Prefix
             backend:
               service:

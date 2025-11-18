@@ -1,18 +1,20 @@
-# ========== build ==========
+# Dockerfile pentru Backend Orchestrator
 FROM mcr.microsoft.com/dotnet/sdk:9.0 AS build
-WORKDIR /src
-COPY . .
-RUN dotnet restore
-RUN dotnet publish -c Release -o /app /p:UseAppHost=false
+WORKDIR /app
 
-# ========== runtime ==========
+COPY *.csproj ./
+RUN dotnet restore
+
+COPY . ./
+RUN dotnet publish -c Release -o out
+
 FROM mcr.microsoft.com/dotnet/aspnet:9.0
 WORKDIR /app
-COPY --from=build /app .
+COPY --from=build /app/out .
 
-# Cloud Run expune portul 8080; suprascriem orice setare din appsettings
-ENV ASPNETCORE_URLS=http://0.0.0.0:8080
+ENV ASPNETCORE_URLS=http://+:8080
+ENV ASPNETCORE_ENVIRONMENT=Production
+
 EXPOSE 8080
 
-# dacă DLL-ul tău se numește altfel, schimbă numele de mai jos
 ENTRYPOINT ["dotnet", "Orchestrator.Local.dll"]

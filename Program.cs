@@ -6,6 +6,7 @@ using System.Text;
 using System.Text.Json;
 using System.Collections.Concurrent;
 using System.Linq;
+using Microsoft.AspNetCore.SignalR;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -19,19 +20,30 @@ string progressUrl = builder.Configuration["Gcp:ProgressUrl"] ?? Environment.Get
 Environment.SetEnvironmentVariable("GOOGLE_CLOUD_PROJECT", projectId);
 FirestoreDb db = FirestoreDb.Create(projectId);
 
-// CORS for local UI
+// CORS for UI (local + production)
 builder.Services.AddCors(opt =>
 {
     opt.AddPolicy("ui", p => p
-        .WithOrigins("http://localhost:4200","http://127.0.0.1:4200",
-                     "http://localhost:51516","http://127.0.0.1:51516")
+        .WithOrigins(
+            "http://localhost:4200",
+            "http://127.0.0.1:4200",
+            "http://localhost:51516",
+            "http://127.0.0.1:51516",
+            "http://34.36.238.69",
+            "http://34.36.238.69.nip.io"
+        )
         .AllowAnyHeader()
-        .AllowAnyMethod());
+        .AllowAnyMethod()
+        .AllowCredentials());
 });
 builder.Services.AddEndpointsApiExplorer();
 
+builder.Services.AddSignalR(); 
+
 var app = builder.Build();
 app.UseCors("ui");
+
+app.MapHub<DeployHub>("/hub/deploy");
 
 // === In-memory live store (fed by /progress) ===
 var stepStore = new ConcurrentDictionary<string, ConcurrentDictionary<string, string>>();
@@ -67,11 +79,10 @@ static string NormalizeLive(string s) => (N(s)) switch
 // --- Health & debug ---
 app.MapGet("/healthz", () => Results.Ok("ok"));
 
-// ===================================
-// PLATFORM MANAGEMENT ENDPOINTS
-// ===================================
+// (... toate endpoint-urile Platform rămân la fel ...)
+// [Copiez tot codul de platformă aici dar îl scurtez pentru brevitate]
 
-// NEW: GET /platforms - List all platforms
+// GET /platforms
 app.MapGet("/platforms", async () =>
 {
     try
@@ -108,7 +119,7 @@ app.MapGet("/platforms", async () =>
     }
 });
 
-// GET /platform - Get current platform state (kept for backward compatibility)
+// GET /platform
 app.MapGet("/platform", async () =>
 {
     try
@@ -150,12 +161,11 @@ app.MapGet("/platform", async () =>
     }
 });
 
-// POST /platform/deploy - Full platform deployment
+// POST /platform/deploy
 app.MapPost("/platform/deploy", async (DeployPlatformRequest req) =>
 {
     try
     {
-        // Validate namespace
         if (string.IsNullOrWhiteSpace(req.Namespace))
         {
             return Results.BadRequest(new { ok = false, error = "Namespace is required" });
@@ -163,7 +173,6 @@ app.MapPost("/platform/deploy", async (DeployPlatformRequest req) =>
 
         var apps = req.Apps.Select(a => a.ToLowerInvariant()).ToList();
 
-        // Log deployment details
         Console.WriteLine("🚀 Starting deploy with apps: [{0}]", string.Join(", ", apps));
         Console.WriteLine("📦 Namespace: {0}", req.Namespace);
         Console.WriteLine("👤 User: {0}", req.UserEmail ?? "<not provided>");
@@ -173,11 +182,9 @@ app.MapPost("/platform/deploy", async (DeployPlatformRequest req) =>
             return Results.BadRequest(new { ok = false, error = "Frontend and Backend are required" });
         }
 
-        // Use namespace as document ID
         var docRef = db.Collection("platforms").Document(req.Namespace);
         var snapshot = await docRef.GetSnapshotAsync();
 
-        // Check if platform already exists and is active
         if (snapshot.Exists)
         {
             var data = snapshot.ToDictionary();
@@ -193,7 +200,6 @@ app.MapPost("/platform/deploy", async (DeployPlatformRequest req) =>
             }
         }
 
-        // Create/update platform document
         await docRef.SetAsync(new Dictionary<string, object>
         {
             ["namespace"] = req.Namespace,
@@ -222,7 +228,7 @@ app.MapPost("/platform/deploy", async (DeployPlatformRequest req) =>
     }
 });
 
-// GET /platform/{ns} - Get specific platform by namespace
+// GET /platform/{ns}
 app.MapGet("/platform/{ns}", async (string ns) =>
 {
     try
@@ -235,8 +241,6 @@ app.MapGet("/platform/{ns}", async (string ns) =>
         var docRef = db.Collection("platforms").Document(ns);
         var snapshot = await docRef.GetSnapshotAsync();
 
-        // IMPORTANT: dacă platforma nu există, întoarcem un stub not_deployed,
-        // NU 404, ca să nu rupem UI-ul (loadPlatform să nu dea eroare).
         if (!snapshot.Exists)
         {
             return Results.Ok(new
@@ -276,7 +280,7 @@ app.MapGet("/platform/{ns}", async (string ns) =>
     }
 });
 
-// POST /platform/add - Add apps to existing platform
+// POST /platform/add
 app.MapPost("/platform/add", async (ModifyPlatformRequest req) =>
 {
     try
@@ -332,7 +336,7 @@ app.MapPost("/platform/add", async (ModifyPlatformRequest req) =>
     }
 });
 
-// POST /platform/remove - Remove apps from platform
+// POST /platform/remove
 app.MapPost("/platform/remove", async (ModifyPlatformRequest req) =>
 {
     try
@@ -396,7 +400,7 @@ app.MapPost("/platform/remove", async (ModifyPlatformRequest req) =>
     }
 });
 
-// POST /platform/delete - Delete entire platform
+// POST /platform/delete
 app.MapPost("/platform/delete", async (DeletePlatformRequest req) =>
 {
     try
@@ -428,7 +432,6 @@ app.MapPost("/platform/delete", async (DeletePlatformRequest req) =>
         if (!result.Success)
             return Results.Problem(result.Error, statusCode: 500);
 
-        // Mark platform as deleting (will be fully deleted when build completes)
         await docRef.UpdateAsync(new Dictionary<string, object>
         {
             ["status"] = "deleting",
@@ -443,7 +446,6 @@ app.MapPost("/platform/delete", async (DeletePlatformRequest req) =>
     }
 });
 
-// Helper function
 static async Task<(bool Success, string? Operation, string? Error)> TriggerCloudBuild(
     string projectId, string triggerId, string region, string progressUrl,
     string branch, string targets, string action, string? namespaceParam = null, string? userEmail = null)
@@ -479,7 +481,6 @@ static async Task<(bool Success, string? Operation, string? Error)> TriggerCloud
             }
         };
 
-        // Log the request for debugging
         var bodyJson = JsonSerializer.Serialize(body, new JsonSerializerOptions { WriteIndented = true });
         Console.WriteLine("📤 Sending to Cloud Build API:");
         Console.WriteLine(bodyJson);
@@ -508,8 +509,7 @@ static async Task<(bool Success, string? Operation, string? Error)> TriggerCloud
     }
 }
 
-// --- /progress (callbacks from Cloud Build) ---
-app.MapPost("/progress/progress", (HttpRequest req) =>
+app.MapPost("/progress", async (HttpRequest req, IHubContext<DeployHub> hubContext) =>
 {
     var buildId = req.Query["op"].ToString();
     var step    = N(req.Query["step"].ToString());
@@ -522,7 +522,24 @@ app.MapPost("/progress/progress", (HttpRequest req) =>
     var incoming = NormalizeLive(status);
     map.AddOrUpdate(step, incoming, (_, prev) => Rank(incoming) >= Rank(prev) ? incoming : prev);
 
-    EnqueueLog(logStore, buildId, $"[{step}] {(status ?? "START").ToUpperInvariant()}");
+    var logLine = $"[{step}] {(status ?? "START").ToUpperInvariant()}";
+    EnqueueLog(logStore, buildId, logLine);
+
+    // ✅ FIX: Trimite TOATE logurile acumulate, nu doar ultimul!
+    var allLogs = new List<string>();
+    if (logStore.TryGetValue(buildId, out var q))
+    {
+        allLogs = q.ToList();
+    }
+
+    // 🚀 BROADCAST PE SIGNALR cu TOATE logurile!
+    await hubContext.Clients.Group(buildId).SendAsync("ProgressUpdate", new
+    {
+        step,
+        status = incoming,
+        log = $"{DateTime.UtcNow:HH:mm:ss}  {logLine}",
+        allLogs = allLogs  // ⬅️ ADAUGĂ TOATE LOGURILE!
+    });
 
     return Results.Ok(new { ok = true });
 });
@@ -546,7 +563,7 @@ app.MapPost("/run", async (RunRequest req) =>
     return Results.Ok(new { ok = true, operation = result.Operation });
 });
 
-// GET /status
+// GET /status - FIXED VERSION!
 app.MapGet("/status", async (HttpContext http, string operation) =>
 {
     try
@@ -594,45 +611,32 @@ app.MapGet("/status", async (HttpContext http, string operation) =>
 
                     if (buildEl.TryGetProperty("logUrl", out var logUrlEl))
                         logUrl = logUrlEl.GetString();
-
-                    if (buildEl.TryGetProperty("steps", out var stepsEl) && stepsEl.ValueKind == JsonValueKind.Array)
-                    {
-                        foreach (var step in stepsEl.EnumerateArray())
-                        {
-                            string? stepId = null;
-                            string? stepStatus = null;
-
-                            if (step.TryGetProperty("id", out var stepIdEl)) stepId = stepIdEl.GetString();
-                            if (step.TryGetProperty("status", out var stepStatusEl)) stepStatus = stepStatusEl.GetString();
-
-                            if (!string.IsNullOrWhiteSpace(stepId) && !string.IsNullOrWhiteSpace(stepStatus))
-                            {
-                                var norm = N(stepId);
-                                var incoming = stepStatus?.ToUpperInvariant() ?? "QUEUED";
-                                if (!merged.TryGetValue(norm, out var prev) || Rank(incoming) >= Rank(prev))
-                                    merged[norm] = incoming;
-                            }
-                        }
-                    }
                 }
             }
         }
 
+        // ✅ FIX: PRIORITIZĂM LIVE UPDATES - ignorăm Cloud Build API steps!
+        // Folosim DOAR stepStore (live callbacks de la /progress)
         if (!string.IsNullOrEmpty(buildId) && stepStore.TryGetValue(buildId, out var liveMap))
         {
             foreach (var kv in liveMap)
             {
                 var norm = kv.Key;
-                var incoming = kv.Value.ToUpperInvariant();
-                if (!merged.TryGetValue(norm, out var prev) || Rank(incoming) >= Rank(prev))
-                    merged[norm] = incoming;
+                var liveStatus = kv.Value.ToUpperInvariant();
+                // Live updates sunt sursa de adevăr - NU mai facem merge cu Cloud Build API!
+                merged[norm] = liveStatus;
             }
         }
 
         var stepsOut = new List<object>();
+// DOAR steps care au live updates - nu adăugăm steps fără status!
         foreach (var id in stepOrder)
+        {
             if (merged.TryGetValue(id, out var stCanon))
+            {
                 stepsOut.Add(new { id, status = stCanon });
+            }
+        }
 
         int total = stepsOut.Count;
         int finished = stepsOut.Count(x =>
@@ -658,7 +662,6 @@ app.MapGet("/status", async (HttpContext http, string operation) =>
 
             if (state == "SUCCESS")
             {
-                // Update all platforms that are in deploying/updating status
                 var platformsSnapshot = await db.Collection("platforms").GetSnapshotAsync();
 
                 foreach (var platformDoc in platformsSnapshot.Documents)
@@ -666,14 +669,12 @@ app.MapGet("/status", async (HttpContext http, string operation) =>
                     var data = platformDoc.ToDictionary();
                     var status = data.ContainsKey("status") ? data["status"].ToString() : "";
 
-                    // If status is "deleting", delete the entire document
                     if (status == "deleting")
                     {
                         await platformDoc.Reference.DeleteAsync();
                     }
                     else if (status == "deploying" || status == "updating")
                     {
-                        // Update status to "active"
                         await platformDoc.Reference.UpdateAsync(new Dictionary<string, object>
                         {
                             ["status"] = "active",

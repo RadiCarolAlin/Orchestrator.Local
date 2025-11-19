@@ -93,7 +93,6 @@ string[] stepOrder = new[]
     "github",
 };
 string[] requiredApps = new[] { "frontend", "backend" }; // Always required
-System.Console.WriteLine("Albert was here!");
 static string N(string? s) => (s ?? "").Trim().ToLowerInvariant();
 static int Rank(string s) =>
     (N(s)) switch
@@ -119,9 +118,6 @@ ConcurrentDictionary<string, string> operationToBuildId = new();
 
 // --- Health & debug ---
 app.MapGet("/healthz", () => Results.Ok("ok"));
-
-// (... toate endpoint-urile Platform rămân la fel ...)
-// [Copiez tot codul de platformă aici dar îl scurtez pentru brevitate]
 
 // GET /platforms
 app.MapGet(
@@ -707,7 +703,9 @@ app.MapPost(
         var buildId = req.Query["op"].ToString();
         var step = req.Query["step"].ToString();
         var status = req.Query["status"].ToString();
-        
+
+        var incoming = NormalizeLive(status);
+
         Console.WriteLine($"📡 /progress called: buildId={buildId}, step={step}");
 
         if (string.IsNullOrWhiteSpace(buildId) || string.IsNullOrWhiteSpace(step))
@@ -724,7 +722,16 @@ app.MapPost(
 
         await hubContext
             .Clients.Group(buildId)
-            .SendAsync("ProgressUpdate", new { allLogs = allLogs });
+            .SendAsync(
+                "ProgressUpdate",
+                new
+                {
+                    step,
+                    status = incoming,
+                    log = $"{DateTime.UtcNow:HH:mm:ss}  {logLine}",
+                    allLogs = allLogs,
+                }
+            );
 
         return Results.Ok(new { ok = true });
     }
@@ -757,7 +764,7 @@ app.MapPost(
     }
 );
 
-// GET /status - FIXED VERSION!
+// GET /status
 app.MapGet(
     "/status",
     async (HttpContext http, string operation) =>
@@ -816,21 +823,17 @@ app.MapGet(
                 }
             }
 
-            // ✅ FIX: PRIORITIZĂM LIVE UPDATES - ignorăm Cloud Build API steps!
-            // Folosim DOAR stepStore (live callbacks de la /progress)
             if (!string.IsNullOrEmpty(buildId) && stepStore.TryGetValue(buildId, out var liveMap))
             {
                 foreach (var kv in liveMap)
                 {
                     var norm = kv.Key;
                     var liveStatus = kv.Value.ToUpperInvariant();
-                    // Live updates sunt sursa de adevăr - NU mai facem merge cu Cloud Build API!
                     merged[norm] = liveStatus;
                 }
             }
 
             var stepsOut = new List<object>();
-            // DOAR steps care au live updates - nu adăugăm steps fără status!
             foreach (var id in stepOrder)
             {
                 if (merged.TryGetValue(id, out var stCanon))

@@ -15,8 +15,6 @@ public class DeployHub : Hub
         // Subscribe to the operation group
         await Groups.AddToGroupAsync(Context.ConnectionId, operationId);
 
-        // IMPORTANT: Also try to map to buildId if we know it
-        // The buildId is extracted from the operation name
         // Format: "projects/{project}/locations/{region}/operations/{buildId}"
         var parts = operationId.Split('/');
         if (parts.Length > 0)
